@@ -804,9 +804,7 @@ function connectExternalEngine() {
 
     try {
         // Use TrueNativeWebSocket to bypass CSP restrictions (especially on Lichess)
-        // Falls back to regular WebSocket if TrueNativeWebSocket is unavailable
-        const WebSocketConstructor = TrueNativeWebSocket || WebSocket;
-        externalEngineWs = new WebSocketConstructor(engineUrl);
+        externalEngineWs = new TrueNativeWebSocket(engineUrl);
 
         externalEngineWs.onopen = () => {
             if(debugModeActivated) console.log('[ExtEngine] ✅ Connected');
