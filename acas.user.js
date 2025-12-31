@@ -81,6 +81,9 @@
 // @grant       GM_setClipboard
 // @grant       GM_notification
 // @grant       unsafeWindow
+// @connect      localhost
+// @connect      127.0.0.1
+// @connect      [::1]
 // @run-at      document-start
 // @require     https://update.greasyfork.org/scripts/534637/LegacyGMjs.js?acasv=2
 // @require     https://update.greasyfork.org/scripts/470418/CommLinkjs.js?acasv=2
@@ -113,6 +116,10 @@ DANGER ZONE - DO NOT PROCEED IF YOU DON'T KNOW WHAT YOU'RE DOING*\
 \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 //////////////////////////////////////////////////////////////////
 DANGER ZONE - DO NOT PROCEED IF YOU DON'T KNOW WHAT YOU'RE DOING*/
+
+// Capture native WebSocket before page's CSP can interfere
+// This enables external engine connections on sites with strict CSP (like Lichess)
+const TrueNativeWebSocket = (typeof unsafeWindow !== 'undefined' ? unsafeWindow.WebSocket : null) || window.WebSocket;
 
 // IMMEDIATE: Signal userscript presence before async operations
 // This prevents race conditions where page scripts check before userscript is ready
@@ -796,7 +803,10 @@ function connectExternalEngine() {
     if(debugModeActivated) console.log('[ExtEngine] Connecting to', engineUrl);
 
     try {
-        externalEngineWs = new WebSocket(engineUrl);
+        // Use TrueNativeWebSocket to bypass CSP restrictions (especially on Lichess)
+        // Falls back to regular WebSocket if TrueNativeWebSocket is unavailable
+        const WebSocketConstructor = TrueNativeWebSocket || WebSocket;
+        externalEngineWs = new WebSocketConstructor(engineUrl);
 
         externalEngineWs.onopen = () => {
             if(debugModeActivated) console.log('[ExtEngine] ✅ Connected');
