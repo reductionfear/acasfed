@@ -294,13 +294,15 @@ const dbValues = {
     AcasConfig: 'AcasConfig',
     playerColor: instanceID => 'playerColor' + tempValueIndicator + instanceID,
     turn: instanceID => 'turn' + tempValueIndicator + instanceID,
-    fen: instanceID => 'fen' + tempValueIndicator + instanceID
+    fen: instanceID => 'fen' + tempValueIndicator + instanceID,
+    externalEngineState: instanceID => 'externalEngineState' + tempValueIndicator + instanceID
 };
 // Add them to acas-userscript-bridge.js as well if you,
 // decide to add more variables here
 const instanceVars = {
     playerColor: createInstanceVariable('playerColor'),
-    fen: createInstanceVariable('fen')
+    fen: createInstanceVariable('fen'),
+    externalEngineState: createInstanceVariable('externalEngineState')
 };
 
 function exposeViaMessages() {
@@ -437,6 +439,8 @@ function getUniqueID() {
 
 const commLinkInstanceID = getUniqueID();
 
+const greasyforkURL = 'https://greasyfork.org/en/scripts/471519-1-chess-assistant-a-c-a-s-advanced-chess-assistance-system';
+
 const blacklistedURLs = [
     constructBackendURL(backendConfig?.hosts?.prod),
     constructBackendURL(backendConfig?.hosts?.dev),
@@ -508,7 +512,9 @@ const configKeys = {
     'advancedEloProbability': 'advancedEloProbability',
     'advancedEloHash': 'advancedEloHash',
     'advancedEloThreads': 'advancedEloThreads',
-    'proModeEnabled': 'proModeEnabled'
+    'proModeEnabled': 'proModeEnabled',
+    'useExternalEngine': 'useExternalEngine',
+    'externalEngineUrl': 'externalEngineUrl'
 };
 
 const config = {};
@@ -567,6 +573,13 @@ let modDrawerListeners = [];
 let modLastEnteredSquare = { 'squareIndex': null, 'squareFen': null, 'pieceFen': null };
 
 let isMovesOnDemandActive = false;
+
+// External Engine State
+let externalEngineWs = null;
+let externalEngineReady = false;
+let externalEngineConnected = false;
+let externalEngineReconnectTimer = null;
+const externalEngineListeners = new Set();
 
 const supportedSites = {};
 
@@ -751,6 +764,154 @@ function displayFeedback(addedFeedback) {
     }
 
     addedFeedback.forEach(processFeedback);
+}
+
+// External Engine WebSocket Management
+function updateExternalEngineState() {
+    if (typeof commLinkInstanceID !== 'undefined') {
+        const state = {
+            connected: externalEngineConnected,
+            ready: externalEngineReady,
+            enabled: getConfigValue(configKeys.useExternalEngine),
+            url: getConfigValue(configKeys.externalEngineUrl) || 'ws://localhost:8080/ws'
+        };
+        instanceVars.externalEngineState.set(commLinkInstanceID, state);
+    }
+}
+
+function connectExternalEngine() {
+    const useExtEngine = getConfigValue(configKeys.useExternalEngine);
+    const engineUrl = getConfigValue(configKeys.externalEngineUrl) || 'ws://localhost:8080/ws';
+    
+    if (!useExtEngine) {
+        if(debugModeActivated) console.log('[ExtEngine] External engine disabled');
+        return;
+    }
+    
+    if (externalEngineWs && (externalEngineWs.readyState === WebSocket.CONNECTING || externalEngineWs.readyState === WebSocket.OPEN)) {
+        if(debugModeActivated) console.log('[ExtEngine] Already connected or connecting');
+        return;
+    }
+
+    if(debugModeActivated) console.log('[ExtEngine] Connecting to', engineUrl);
+
+    try {
+        externalEngineWs = new WebSocket(engineUrl);
+
+        externalEngineWs.onopen = () => {
+            if(debugModeActivated) console.log('[ExtEngine] ✅ Connected');
+            externalEngineConnected = true;
+            externalEngineReady = false;
+            updateExternalEngineState();
+
+            // Subscribe to engine output
+            externalEngineWs.send('sub');
+
+            // Query engine info
+            externalEngineWs.send('whoareyou');
+            externalEngineWs.send('whatengine');
+
+            // Configure engine
+            setTimeout(() => {
+                sendToEngine('uci');
+                sendToEngine('isready');
+            }, 100);
+        };
+
+        externalEngineWs.onmessage = (e) => {
+            const data = e.data;
+            if(debugModeActivated) console.log('[ExtEngine]', data);
+
+            if (data.startsWith('iam ')) {
+                if(debugModeActivated) console.log('[ExtEngine] Server:', data);
+            } else if (data.startsWith('engine ')) {
+                if(debugModeActivated) console.log('[ExtEngine] Engine:', data);
+            } else if (data === 'authok') {
+                if(debugModeActivated) console.log('[ExtEngine] ✅ Authenticated');
+            } else if (data === 'autherr') {
+                if(debugModeActivated) console.log('[ExtEngine] ❌ Authentication failed');
+            } else if (data === 'subok') {
+                if(debugModeActivated) console.log('[ExtEngine] ✅ Subscribed to engine output');
+            } else if (data === 'readyok') {
+                externalEngineReady = true;
+                updateExternalEngineState();
+                if(debugModeActivated) console.log('[ExtEngine] ✅ Ready!');
+            } else {
+                // Route all other messages (info, bestmove) to listeners
+                for (const fn of externalEngineListeners) {
+                    try { fn({ data }); } catch(x) {
+                        if(debugModeActivated) console.error('[ExtEngine] Listener error:', x);
+                    }
+                }
+            }
+        };
+
+        externalEngineWs.onerror = (err) => {
+            console.error('[ExtEngine] ❌ Error:', err);
+            externalEngineConnected = false;
+            externalEngineReady = false;
+            updateExternalEngineState();
+        };
+
+        externalEngineWs.onclose = () => {
+            if(debugModeActivated) console.log('[ExtEngine] Disconnected');
+            externalEngineConnected = false;
+            externalEngineReady = false;
+            updateExternalEngineState();
+
+            // Auto-reconnect if external engine is enabled
+            const useExtEngine = getConfigValue(configKeys.useExternalEngine);
+            if (useExtEngine) {
+                if(debugModeActivated) console.log('[ExtEngine] Reconnecting in 3s...');
+                if (externalEngineReconnectTimer) clearTimeout(externalEngineReconnectTimer);
+                externalEngineReconnectTimer = setTimeout(() => {
+                    connectExternalEngine();
+                }, 3000);
+            }
+        };
+    } catch (err) {
+        console.error('[ExtEngine] Failed to connect:', err);
+        externalEngineConnected = false;
+        externalEngineReady = false;
+        updateExternalEngineState();
+    }
+}
+
+function disconnectExternalEngine() {
+    if (externalEngineReconnectTimer) {
+        clearTimeout(externalEngineReconnectTimer);
+        externalEngineReconnectTimer = null;
+    }
+
+    if (externalEngineWs) {
+        externalEngineWs.close();
+        externalEngineWs = null;
+    }
+
+    externalEngineConnected = false;
+    externalEngineReady = false;
+    updateExternalEngineState();
+    if(debugModeActivated) console.log('[ExtEngine] Disconnected');
+}
+
+function sendToEngine(cmd) {
+    const useExtEngine = getConfigValue(configKeys.useExternalEngine);
+    
+    if (useExtEngine && externalEngineConnected && externalEngineWs && externalEngineWs.readyState === WebSocket.OPEN) {
+        if(debugModeActivated) console.log('[ExtEngine] Sending:', cmd);
+        externalEngineWs.send(cmd);
+        return true;
+    }
+    
+    return false;
+}
+
+function addExternalEngineListener(callback) {
+    externalEngineListeners.add(callback);
+}
+
+function removeExternalEngineListener(callback) {
+    externalEngineListeners.delete(callback);
 }
 
 const boardUtils = {
@@ -3786,6 +3947,13 @@ async function start() {
 
     refreshSettings();
     observeNewMoves();
+    
+    // Initialize external engine if enabled
+    updateExternalEngineState();
+    if (getConfigValue(configKeys.useExternalEngine)) {
+        if(debugModeActivated) console.log('[ExtEngine] Auto-connecting on start');
+        setTimeout(() => connectExternalEngine(), 500);
+    }
 
     CommLink.setIntervalAsync(async () => {
         await CommLink.commands.createInstance(commLinkInstanceID);
@@ -3877,6 +4045,69 @@ if(typeof GM_registerMenuCommand === 'function') {
             }
         }, 'c');
     }
+
+    // External Engine Commands
+    GM_registerMenuCommand('[e] Toggle External Engine', e => {
+        const currentValue = getConfigValue(configKeys.useExternalEngine);
+        const newValue = !currentValue;
+        
+        // Update config
+        const config = GM_getValue(dbValues.AcasConfig) || {};
+        if (!config.global) config.global = {};
+        if (!config.global.profiles) config.global.profiles = {};
+        if (!config.global.profiles.default) config.global.profiles.default = {};
+        config.global.profiles.default.useExternalEngine = newValue;
+        GM_setValue(dbValues.AcasConfig, config);
+        
+        if (newValue) {
+            displayImportantNotification('External Engine', 'External engine enabled. Connecting...');
+            connectExternalEngine();
+        } else {
+            displayImportantNotification('External Engine', 'External engine disabled.');
+            disconnectExternalEngine();
+        }
+    }, 'e');
+
+    GM_registerMenuCommand('[x] Configure External Engine URL', e => {
+        const currentUrl = getConfigValue(configKeys.externalEngineUrl) || 'ws://localhost:8080/ws';
+        const newUrl = prompt('Enter external engine WebSocket URL:', currentUrl);
+        
+        if (newUrl && newUrl !== currentUrl) {
+            // Update config
+            const config = GM_getValue(dbValues.AcasConfig) || {};
+            if (!config.global) config.global = {};
+            if (!config.global.profiles) config.global.profiles = {};
+            if (!config.global.profiles.default) config.global.profiles.default = {};
+            config.global.profiles.default.externalEngineUrl = newUrl;
+            GM_setValue(dbValues.AcasConfig, config);
+            
+            displayImportantNotification('External Engine', 'URL updated. Reconnecting...');
+            
+            // Reconnect if currently enabled
+            if (getConfigValue(configKeys.useExternalEngine)) {
+                disconnectExternalEngine();
+                setTimeout(() => connectExternalEngine(), 500);
+            }
+        }
+    }, 'x');
+
+    GM_registerMenuCommand('[i] External Engine Status', e => {
+        const useExtEngine = getConfigValue(configKeys.useExternalEngine);
+        const engineUrl = getConfigValue(configKeys.externalEngineUrl) || 'ws://localhost:8080/ws';
+        
+        let status = 'External Engine Status:\n\n';
+        status += `Enabled: ${useExtEngine ? 'Yes' : 'No'}\n`;
+        status += `URL: ${engineUrl}\n`;
+        status += `Connected: ${externalEngineConnected ? 'Yes' : 'No'}\n`;
+        status += `Ready: ${externalEngineReady ? 'Yes' : 'No'}\n`;
+        
+        if (externalEngineWs) {
+            const states = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+            status += `WebSocket State: ${states[externalEngineWs.readyState] || 'Unknown'}\n`;
+        }
+        
+        displayImportantNotification('External Engine Status', status);
+    }, 'i');
 }
 
 setInterval(initializeIfSiteReady, 1000);
